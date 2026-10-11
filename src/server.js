@@ -171,9 +171,30 @@ async function waitForGatewayReady(opts = {}) {
   return false;
 }
 
+// OpenClaw exits with code 78 (EX_CONFIG) when an upgrade needs a one-time state
+// migration ("gateway.maintenance_required"). Run `openclaw doctor --fix` once
+// automatically in that case, then start the gateway again.
+const GATEWAY_EXIT_MAINTENANCE_REQUIRED = 78;
+let maintenanceRepairAttempted = false;
+let maintenanceRepairRunning = false;
+
+async function runMaintenanceRepair(reason) {
+  if (maintenanceRepairRunning) return { code: 0, output: "Repair already running.\n" };
+  maintenanceRepairRunning = true;
+  try {
+    console.log(`[wrapper] running 'openclaw doctor --fix' (${reason})`);
+    const r = await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix", "--yes", "--non-interactive"]));
+    console.log(`[wrapper] doctor --fix finished exit=${r.code}`);
+    return r;
+  } finally {
+    maintenanceRepairRunning = false;
+  }
+}
+
 async function startGateway() {
   if (gatewayProc) return;
   if (!isConfigured()) throw new Error("Gateway cannot start: not configured");
+  if (maintenanceRepairRunning) throw new Error("Gateway cannot start: maintenance repair in progress");
 
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
@@ -212,6 +233,17 @@ async function startGateway() {
     console.error(msg);
     lastGatewayExit = { code, signal, at: new Date().toISOString() };
     gatewayProc = null;
+    if (code === GATEWAY_EXIT_MAINTENANCE_REQUIRED && !maintenanceRepairAttempted) {
+      maintenanceRepairAttempted = true;
+      runMaintenanceRepair("gateway reported maintenance required")
+        .then(async () => {
+          // A boot-time start attempt may still be waiting for readiness; let it settle
+          // (it will fail) so ensureGatewayRunning() launches a fresh gateway process.
+          if (gatewayStarting) await gatewayStarting.catch(() => {});
+          return ensureGatewayRunning();
+        })
+        .catch((err) => console.error(`[wrapper] automatic maintenance repair failed: ${String(err)}`));
+    }
   });
 }
 
@@ -522,6 +554,7 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
         <option value="openclaw.status">openclaw status</option>
         <option value="openclaw.health">openclaw health</option>
         <option value="openclaw.doctor">openclaw doctor</option>
+        <option value="openclaw.doctor.fix">openclaw doctor --fix (stops gateway, repairs, restarts)</option>
         <option value="openclaw.logs.tail">openclaw logs --tail N</option>
         <option value="openclaw.config.get">openclaw config get &lt;path&gt;</option>
         <option value="openclaw.version">openclaw --version</option>
@@ -1087,6 +1120,7 @@ const ALLOWED_CONSOLE_COMMANDS = new Set([
   "openclaw.status",
   "openclaw.health",
   "openclaw.doctor",
+  "openclaw.doctor.fix",
   "openclaw.logs.tail",
   "openclaw.config.get",
 
@@ -1141,6 +1175,23 @@ app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
     if (cmd === "openclaw.doctor") {
       const r = await runCmd(OPENCLAW_NODE, clawArgs(["doctor"]));
       return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
+    }
+    if (cmd === "openclaw.doctor.fix") {
+      // Stop the gateway, apply OpenClaw's recommended repairs/migrations, start again.
+      if (gatewayProc) {
+        try { gatewayProc.kill("SIGTERM"); } catch {}
+        await sleep(750);
+        gatewayProc = null;
+      }
+      const r = await runMaintenanceRepair("requested from /setup console");
+      let startMsg = "";
+      try {
+        await ensureGatewayRunning();
+        startMsg = "\nGateway started.\n";
+      } catch (err) {
+        startMsg = `\nGateway did not start: ${String(err)}\n`;
+      }
+      return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) + startMsg });
     }
     if (cmd === "openclaw.logs.tail") {
       const lines = Math.max(50, Math.min(1000, Number.parseInt(arg || "200", 10) || 200));
