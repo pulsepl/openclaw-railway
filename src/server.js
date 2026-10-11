@@ -271,6 +271,137 @@ async function restartGateway() {
   return ensureGatewayRunning();
 }
 
+// --- Hardened password auth (shared by /setup, the dashboard and WebSocket upgrades) ---
+// - constant-time comparison
+// - per-client lockout after repeated wrong passwords
+// - a signed, HttpOnly session cookie so WebSocket upgrades (which browsers cannot
+//   attach Basic auth headers to) can be authenticated too.
+const AUTH_FAIL_WINDOW_MS = 15 * 60 * 1000;
+const AUTH_FAIL_MAX = 10;
+const authFailures = new Map(); // clientKey -> { count, first }
+const SESSION_COOKIE = "oc_session";
+const SESSION_MAX_AGE_S = 30 * 24 * 60 * 60;
+
+function clientKey(req) {
+  // Railway's edge sets X-Real-IP; fall back to the last X-Forwarded-For hop (added by
+  // the nearest proxy, not the client) and finally the socket address.
+  const realIp = String(req.headers["x-real-ip"] || "").trim();
+  if (realIp) return realIp;
+  const xff = String(req.headers["x-forwarded-for"] || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (xff.length) return xff[xff.length - 1];
+  return req.socket?.remoteAddress || "unknown";
+}
+
+// Backstop in case client IPs can be spoofed: cap total failures across all clients.
+const AUTH_GLOBAL_FAIL_MAX = 200;
+let globalAuthFailures = { count: 0, first: 0 };
+
+function isAuthLockedOut(key) {
+  const now = Date.now();
+  if (now - globalAuthFailures.first > AUTH_FAIL_WINDOW_MS) {
+    globalAuthFailures = { count: 0, first: now };
+  }
+  if (globalAuthFailures.count >= AUTH_GLOBAL_FAIL_MAX) return true;
+  const entry = authFailures.get(key);
+  if (!entry) return false;
+  if (Date.now() - entry.first > AUTH_FAIL_WINDOW_MS) {
+    authFailures.delete(key);
+    return false;
+  }
+  return entry.count >= AUTH_FAIL_MAX;
+}
+
+function recordAuthFailure(key) {
+  const now = Date.now();
+  if (now - globalAuthFailures.first > AUTH_FAIL_WINDOW_MS) {
+    globalAuthFailures = { count: 0, first: now };
+  }
+  globalAuthFailures.count += 1;
+  const entry = authFailures.get(key);
+  if (!entry || now - entry.first > AUTH_FAIL_WINDOW_MS) {
+    authFailures.set(key, { count: 1, first: now });
+  } else {
+    entry.count += 1;
+  }
+  if (authFailures.size > 10000) {
+    for (const [k, v] of authFailures) {
+      if (now - v.first > AUTH_FAIL_WINDOW_MS) authFailures.delete(k);
+    }
+  }
+}
+
+function safeEqual(a, b) {
+  const ha = crypto.createHash("sha256").update(String(a ?? "")).digest();
+  const hb = crypto.createHash("sha256").update(String(b ?? "")).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+function sessionCookieValue() {
+  // Derived from SETUP_PASSWORD: changing the password invalidates every session.
+  return crypto
+    .createHmac("sha256", SETUP_PASSWORD)
+    .update("openclaw-dashboard-session-v1")
+    .digest("base64url");
+}
+
+function sessionCookieHeader() {
+  return `${SESSION_COOKIE}=${sessionCookieValue()}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_MAX_AGE_S}`;
+}
+
+function hasValidSessionCookie(req) {
+  if (!SETUP_PASSWORD) return false;
+  const raw = String(req.headers.cookie || "");
+  for (const part of raw.split(";")) {
+    const i = part.indexOf("=");
+    if (i < 0) continue;
+    if (part.slice(0, i).trim() === SESSION_COOKIE) {
+      return safeEqual(part.slice(i + 1).trim(), sessionCookieValue());
+    }
+  }
+  return false;
+}
+
+// Returns "ok" | "missing" | "invalid" | "locked". Records failures.
+function checkBasicPassword(req) {
+  const key = clientKey(req);
+  if (isAuthLockedOut(key)) return "locked";
+  const header = req.headers.authorization || "";
+  const [scheme, encoded] = header.split(" ");
+  if (scheme !== "Basic" || !encoded) return "missing";
+  const decoded = Buffer.from(encoded, "base64").toString("utf8");
+  const idx = decoded.indexOf(":");
+  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+  if (!safeEqual(password, SETUP_PASSWORD)) {
+    recordAuthFailure(key);
+    return "invalid";
+  }
+  authFailures.delete(key);
+  return "ok";
+}
+
+// Express helper: sends the right error response and returns false, or returns true.
+function enforcePassword(req, res, realm) {
+  const result = checkBasicPassword(req);
+  if (result === "ok") {
+    if (!hasValidSessionCookie(req)) {
+      req.ocSetCookie = sessionCookieHeader();
+      res.append("Set-Cookie", req.ocSetCookie);
+    }
+    return true;
+  }
+  if (result === "locked") {
+    res.set("Retry-After", String(Math.ceil(AUTH_FAIL_WINDOW_MS / 1000)));
+    res.status(429).type("text/plain").send("Too many failed password attempts. Try again later.");
+    return false;
+  }
+  res.set("WWW-Authenticate", `Basic realm="${realm}"`);
+  res.status(401).send(result === "missing" ? "Auth required" : "Invalid password");
+  return false;
+}
+
 function requireSetupAuth(req, res, next) {
   if (!SETUP_PASSWORD) {
     return res
@@ -278,20 +409,7 @@ function requireSetupAuth(req, res, next) {
       .type("text/plain")
       .send("SETUP_PASSWORD is not set. Set it in Railway Variables before using /setup.");
   }
-
-  const header = req.headers.authorization || "";
-  const [scheme, encoded] = header.split(" ");
-  if (scheme !== "Basic" || !encoded) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
-    return res.status(401).send("Auth required");
-  }
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  if (password !== SETUP_PASSWORD) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
-    return res.status(401).send("Invalid password");
-  }
+  if (!enforcePassword(req, res, "OpenClaw Setup")) return;
   return next();
 }
 
@@ -337,20 +455,12 @@ app.get("/healthz", async (_req, res) => {
     }
   }
 
+  // Public endpoint: only report up/down. Paths, targets and gateway error text stay
+  // behind the setup password (see /setup/api/status and /setup/api/debug).
   res.json({
     ok: true,
-    wrapper: {
-      configured: isConfigured(),
-      stateDir: STATE_DIR,
-      workspaceDir: WORKSPACE_DIR,
-    },
-    gateway: {
-      target: GATEWAY_TARGET,
-      reachable: gatewayReachable,
-      lastError: lastGatewayError,
-      lastExit: lastGatewayExit,
-      lastDoctorAt,
-    },
+    wrapper: { configured: isConfigured() },
+    gateway: { reachable: gatewayReachable },
   });
 });
 
@@ -1335,21 +1445,17 @@ function requireDashboardAuth(req, res, next) {
   if (req.path === "/healthz" || req.path === "/setup/healthz") return next();
   if (req.path.startsWith("/hooks")) return next(); // allow OpenClaw webhook endpoints to bypass dashboard auth
   if (!SETUP_PASSWORD) return next(); // no password configured → open
-  const header = req.headers.authorization || "";
-  const [scheme, encoded] = header.split(" ");
-  if (scheme !== "Basic" || !encoded) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Dashboard"');
-    return res.status(401).send("Auth required");
-  }
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  if (password !== SETUP_PASSWORD) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Dashboard"');
-    return res.status(401).send("Invalid password");
-  }
+  if (!enforcePassword(req, res, "OpenClaw Dashboard")) return;
   return next();
 }
+
+// Keep our session cookie when the proxied gateway response sets its own cookies
+// (http-proxy copies upstream headers with setHeader, which would otherwise replace ours).
+proxy.on("proxyRes", (proxyRes, req) => {
+  if (!req.ocSetCookie) return;
+  const existing = proxyRes.headers["set-cookie"];
+  proxyRes.headers["set-cookie"] = existing ? [].concat(existing, req.ocSetCookie) : [req.ocSetCookie];
+});
 
 // --- Gateway token injection ---
 // The gateway is only reachable from this container. The Control UI in the browser
@@ -1460,9 +1566,24 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
 });
 
 server.on("upgrade", async (req, socket, head) => {
-  // Note: browsers cannot attach arbitrary HTTP headers (including Authorization: Basic)
-  // in WebSocket handshakes. Do not enforce dashboard Basic auth at the upgrade layer.
-  // The gateway authenticates at the protocol layer and we inject the gateway token below.
+  // Browsers cannot attach Authorization headers to WebSocket handshakes, but they do
+  // send same-origin cookies. Because the wrapper injects the gateway token below, an
+  // unauthenticated upgrade would otherwise reach the gateway with admin credentials.
+  // Require either the dashboard session cookie (set after a successful password login)
+  // or a valid Basic header (non-browser clients).
+  if (SETUP_PASSWORD && !hasValidSessionCookie(req)) {
+    const result = checkBasicPassword(req);
+    if (result !== "ok") {
+      const status = result === "locked" ? "429 Too Many Requests" : "401 Unauthorized";
+      try {
+        socket.write(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+      } catch {
+        // ignore
+      }
+      socket.destroy();
+      return;
+    }
+  }
 
   if (!isConfigured()) {
     socket.destroy();
